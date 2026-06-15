@@ -21,15 +21,24 @@ from atomic_file import (
     atomic_write,
     atomic_write_read,
     check_crash_safety,
+    doctor,
+    batch_write,
     main,
     FsyncStatus,
+    FailPhase,
+    AtomicWriteError,
     AtomicWriteResult,
     CheckResult,
+    DoctorResult,
+    BatchResult,
+    BatchItemResult,
     EXIT_SUCCESS,
     EXIT_WRITE_FAILED,
     EXIT_DEGRADED_SUCCESS,
     EXIT_INVALID_ARGS,
     EXIT_POST_RENAME_FAILURE,
+    EXIT_PARTIAL_BATCH_FAILURE,
+    EXIT_TOTAL_BATCH_FAILURE,
 )
 
 
@@ -89,7 +98,7 @@ class TestAtomicWrite(unittest.TestCase):
             return original_fdopen(*args, **kwargs)
 
         with mock.patch.object(os, 'fdopen', side_effect=failing_fdopen_after_mkstemp):
-            with self.assertRaises(IOError):
+            with self.assertRaises((OSError, AtomicWriteError)):
                 atomic_write(target, 'NEW CONTENT that should never appear')
 
         self.assertEqual(atomic_write_read(target), old_data)
@@ -142,7 +151,7 @@ class TestAtomicWrite(unittest.TestCase):
             return original_fdopen(*args, **kwargs)
 
         with mock.patch.object(os, 'fdopen', side_effect=failing_fdopen):
-            with self.assertRaises(IOError):
+            with self.assertRaises((OSError, AtomicWriteError)):
                 atomic_write(new_target, 'new data that will fail')
 
         self.assertEqual(atomic_write_read(target), old_data)
@@ -167,7 +176,7 @@ class TestAtomicWrite(unittest.TestCase):
             return original_fdopen(*args, **kwargs)
 
         with mock.patch.object(os, 'fdopen', side_effect=failing_fdopen):
-            with self.assertRaises(IOError):
+            with self.assertRaises((OSError, AtomicWriteError)):
                 atomic_write(target, 'some data')
 
         entries = list(os.listdir(self.test_dir))
@@ -215,7 +224,7 @@ class TestAtomicWrite(unittest.TestCase):
             return FailingBytesIO(wrapper)
 
         with mock.patch.object(os, 'fdopen', side_effect=mock_fdopen):
-            with self.assertRaises(IOError):
+            with self.assertRaises((OSError, AtomicWriteError)):
                 atomic_write(target, b'A' * 100000)
 
         entries = list(os.listdir(self.test_dir))
@@ -244,7 +253,7 @@ class TestAtomicWrite(unittest.TestCase):
                         with lock:
                             writes_done[0] += 1
                         break
-                    except PermissionError:
+                    except (PermissionError, AtomicWriteError):
                         attempt += 1
                         time.sleep(0.01)
                     except Exception as e:
@@ -524,8 +533,9 @@ class TestAtomicWrite(unittest.TestCase):
     def test_cli_mutually_exclusive_args(self):
         target = os.path.join(self.test_dir, 'cli_excl.txt')
         argv = [target, '--text', 'foo', '--file', 'bar']
-        with self.assertRaises(SystemExit):
-            main(argv)
+        exit_code = main(argv)
+        self.assertEqual(exit_code, EXIT_INVALID_ARGS)
+        self.assertFalse(os.path.exists(target))
 
     def test_cli_permissions_flag(self):
         if sys.platform == 'win32':
@@ -565,10 +575,10 @@ class TestAtomicWrite(unittest.TestCase):
             with mock.patch.object(module, attr, side_effect=make_failing(original, call_flag)):
                 try:
                     atomic_write(target, 'NEW CONTENT THAT SHOULD NOT APPEAR')
-                except IOError:
+                except (OSError, AtomicWriteError):
                     pass
                 else:
-                    self.fail(f'Expected IOError when failing at {name}')
+                    self.fail(f'Expected OSError/AtomicWriteError when failing at {name}')
 
             self.assertEqual(
                 atomic_write_read(target),
@@ -609,7 +619,7 @@ class TestRenamedField(unittest.TestCase):
             return original_fdopen(*args, **kwargs)
 
         with mock.patch.object(os, 'fdopen', side_effect=failing_fdopen):
-            with self.assertRaises(IOError):
+            with self.assertRaises((OSError, AtomicWriteError)):
                 result = atomic_write(target, 'data')
 
     def test_renamed_true_on_post_rename_fsync_failure(self):
@@ -778,6 +788,435 @@ class TestExitCode4(unittest.TestCase):
             exit_code = main([target, '--text', 'new content', '--strict'])
         self.assertEqual(exit_code, EXIT_WRITE_FAILED)
         self.assertFalse(os.path.exists(target))
+
+
+class TestFailPhase(unittest.TestCase):
+    """测试 FailPhase / AtomicWriteError 的精确分类"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='atomic_phase_')
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_temp_fsync_failure_is_before_rename(self):
+        target = os.path.join(self.test_dir, 'tempfsync.txt')
+        old_data = 'OLD DATA'
+        atomic_write(target, old_data)
+        self.assertEqual(atomic_write_read(target), old_data)
+
+        with mock.patch.object(atomic_file, '_fsync_file') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Simulated temp fsync failure')
+            try:
+                atomic_write(target, 'NEW DATA')
+            except AtomicWriteError as e:
+                self.assertEqual(e.phase, FailPhase.BEFORE_RENAME)
+                self.assertFalse(e.target_modified)
+            except Exception as e:
+                self.fail(f'Expected AtomicWriteError, got {type(e)}: {e}')
+            else:
+                self.fail('Expected AtomicWriteError for temp fsync failure')
+
+        self.assertEqual(atomic_write_read(target), old_data)
+
+    def test_dir_fsync_strict_failure_is_after_rename(self):
+        target = os.path.join(self.test_dir, 'dirfsync.txt')
+        old_data = 'OLD'
+        atomic_write(target, old_data)
+
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Simulated dir fsync failure')
+            try:
+                atomic_write(target, 'NEW', strict=True)
+            except AtomicWriteError as e:
+                self.assertEqual(e.phase, FailPhase.AFTER_RENAME)
+                self.assertTrue(e.target_modified)
+            else:
+                self.fail('Expected AtomicWriteError for dir fsync strict failure')
+
+        self.assertEqual(atomic_write_read(target), 'NEW')
+
+    def test_dir_fsync_no_degraded_failure_is_after_rename(self):
+        target = os.path.join(self.test_dir, 'nodeg.txt')
+        old_data = 'OLD'
+        atomic_write(target, old_data)
+
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Simulated dir fsync failure')
+            try:
+                atomic_write(target, 'NEW2', allow_degraded=False)
+            except AtomicWriteError as e:
+                self.assertEqual(e.phase, FailPhase.AFTER_RENAME)
+                self.assertTrue(e.target_modified)
+            else:
+                self.fail('Expected AtomicWriteError')
+
+        self.assertEqual(atomic_write_read(target), 'NEW2')
+
+    def test_mkstemp_failure_is_before_rename(self):
+        target = os.path.join(self.test_dir, 'mkstempfail.txt')
+        with mock.patch.object(tempfile, 'mkstemp') as mock_mk:
+            mock_mk.side_effect = OSError(30, 'Read-only filesystem')
+            try:
+                atomic_write(target, 'data')
+            except AtomicWriteError as e:
+                self.assertEqual(e.phase, FailPhase.BEFORE_RENAME)
+                self.assertFalse(e.target_modified)
+            else:
+                self.fail('Expected AtomicWriteError')
+
+        self.assertFalse(os.path.exists(target))
+
+    def test_rename_failure_is_before_rename(self):
+        target = os.path.join(self.test_dir, 'renamefail.txt')
+        with mock.patch.object(os, 'replace') as mock_replace:
+            mock_replace.side_effect = OSError(18, 'Invalid cross-device link')
+            try:
+                atomic_write(target, 'data')
+            except AtomicWriteError as e:
+                self.assertEqual(e.phase, FailPhase.BEFORE_RENAME)
+                self.assertFalse(e.target_modified)
+            else:
+                self.fail('Expected AtomicWriteError')
+
+        entries = os.listdir(self.test_dir)
+        tmp_found = [e for e in entries if e.startswith('.~') or e.endswith('.tmp')]
+        self.assertEqual(tmp_found, [])
+
+
+class TestDoctor(unittest.TestCase):
+    """测试 doctor 子命令"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='atomic_doctor_')
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_doctor_returns_doctor_result(self):
+        result = doctor(self.test_dir)
+        self.assertIsInstance(result, DoctorResult)
+        self.assertEqual(result.directory, Path(self.test_dir).resolve())
+        self.assertGreater(len(result.capabilities), 0)
+
+    def test_doctor_checks_expected_capabilities(self):
+        result = doctor(self.test_dir)
+        names = [c.name for c in result.capabilities]
+        expected = [
+            'Parent directory exists',
+            'Same-filesystem atomic rename',
+            'Directory fsync (entry persistence)',
+            'Stdin reading support',
+            'Temp file creation',
+        ]
+        for name in expected:
+            self.assertIn(name, names, f'Missing capability check: {name}')
+
+    def test_doctor_nonexistent_dir(self):
+        target_dir = os.path.join(self.test_dir, 'nonexistent', 'subdir')
+        result = doctor(target_dir)
+        self.assertFalse(result.all_ok)
+
+    def test_doctor_with_mocked_dir_fsync_success(self):
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            result = doctor(self.test_dir)
+        dir_cap = [c for c in result.capabilities if c.name == 'Directory fsync (entry persistence)']
+        self.assertTrue(dir_cap[0].ok)
+
+    def test_doctor_with_mocked_dir_fsync_failure(self):
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Simulated access denied')
+            result = doctor(self.test_dir)
+        self.assertFalse(result.all_ok)
+        dir_cap = [c for c in result.capabilities if c.name == 'Directory fsync (entry persistence)']
+        self.assertFalse(dir_cap[0].ok)
+
+    def test_cli_doctor(self):
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main(['doctor', self.test_dir])
+        self.assertEqual(exit_code, EXIT_SUCCESS)
+
+    def test_cli_doctor_degraded(self):
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Access denied')
+            exit_code = main(['doctor', self.test_dir])
+        self.assertEqual(exit_code, EXIT_DEGRADED_SUCCESS)
+
+    def test_cli_doctor_quiet(self):
+        with mock.patch('builtins.print') as mock_print:
+            exit_code = main(['doctor', self.test_dir, '--quiet'])
+        self.assertIn(exit_code, [EXIT_SUCCESS, EXIT_DEGRADED_SUCCESS])
+
+    def test_cli_doctor_json(self):
+        import json as json_lib
+        with mock.patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+            exit_code = main(['doctor', self.test_dir, '--json'])
+        self.assertIn(exit_code, [EXIT_SUCCESS, EXIT_DEGRADED_SUCCESS])
+        out = mock_out.getvalue()
+        parsed = json_lib.loads(out)
+        self.assertIn('all_ok', parsed)
+        self.assertIn('capabilities', parsed)
+
+
+class TestDryRunEnhanced(unittest.TestCase):
+    """测试增强的 --dry-run：输入校验、权限设置"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='atomic_dry_')
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_dry_run_verifies_text_encoding(self):
+        target = os.path.join(self.test_dir, 'dr_enc.txt')
+        exit_code = main([
+            '--dry-run', target,
+            '--text', 'Hello',
+            '--encoding', 'utf-8',
+        ])
+        self.assertIn(exit_code, [EXIT_SUCCESS, EXIT_DEGRADED_SUCCESS])
+        self.assertFalse(os.path.exists(target))
+
+    def test_dry_run_verifies_invalid_encoding(self):
+        target = os.path.join(self.test_dir, 'dr_badenc.txt')
+        exit_code = main([
+            '--dry-run', target,
+            '--text', 'Hello',
+            '--encoding', 'invalid-encoding-xyz',
+        ])
+        self.assertEqual(exit_code, EXIT_INVALID_ARGS)
+
+    def test_dry_run_verifies_source_file_exists(self):
+        target = os.path.join(self.test_dir, 'dr_src.txt')
+        exit_code = main([
+            '--dry-run', target,
+            '--file', '/nonexistent/path/to/source.bin',
+        ])
+        self.assertEqual(exit_code, EXIT_INVALID_ARGS)
+
+    def test_dry_run_verifies_source_file_stat(self):
+        target = os.path.join(self.test_dir, 'dr_srcok.txt')
+        src = os.path.join(self.test_dir, 'src.bin')
+        with open(src, 'wb') as f:
+            f.write(b'\xde\xad\xbe\xef')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main([
+                '--dry-run', target,
+                '--file', src, '--binary',
+            ])
+        self.assertEqual(exit_code, EXIT_SUCCESS)
+        self.assertFalse(os.path.exists(target))
+
+    def test_dry_run_verifies_permissions(self):
+        target = os.path.join(self.test_dir, 'dr_perm.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main([
+                '--dry-run', target,
+                '--text', 'hello',
+                '--permissions', '644',
+            ])
+        self.assertEqual(exit_code, EXIT_SUCCESS)
+
+    def test_dry_run_does_not_modify_target(self):
+        target = os.path.join(self.test_dir, 'dr_untouched.txt')
+        with open(target, 'w') as f:
+            f.write('ORIGINAL')
+        main([
+            '--dry-run', target,
+            '--text', 'NEW CONTENT',
+        ])
+        self.assertEqual(atomic_write_read(target), 'ORIGINAL')
+
+    def test_dry_run_stdin(self):
+        target = os.path.join(self.test_dir, 'dr_stdin.txt')
+        with mock.patch.object(sys, 'stdin', io.StringIO('piped content')):
+            with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+                mock_fsync.return_value = FsyncStatus.SUCCESS
+                exit_code = main(['--dry-run', target, '--file', '-'])
+        self.assertEqual(exit_code, EXIT_SUCCESS)
+        self.assertFalse(os.path.exists(target))
+
+
+class TestBatchWrite(unittest.TestCase):
+    """测试批量写入"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='atomic_batch_')
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _manifest_path(self, items):
+        p = os.path.join(self.test_dir, 'manifest.json')
+        import json as json_lib
+        with open(p, 'w', encoding='utf-8') as f:
+            json_lib.dump(items, f)
+        return p
+
+    def test_batch_write_list(self):
+        t1 = os.path.join(self.test_dir, 'a.txt')
+        t2 = os.path.join(self.test_dir, 'b.txt')
+        items = [
+            {'target': t1, 'text': 'content_a'},
+            {'target': t2, 'text': 'content_b'},
+        ]
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            result = batch_write(items)
+
+        self.assertIsInstance(result, BatchResult)
+        self.assertEqual(result.total, 2)
+        self.assertEqual(result.succeeded, 2)
+        self.assertEqual(result.failed, 0)
+        self.assertEqual(atomic_write_read(t1), 'content_a')
+        self.assertEqual(atomic_write_read(t2), 'content_b')
+        self.assertTrue(result.all_ok)
+
+    def test_batch_write_manifest_file(self):
+        t1 = os.path.join(self.test_dir, 'ma.txt')
+        items = [
+            {'target': t1, 'text': 'from manifest'},
+        ]
+        manifest = self._manifest_path(items)
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            result = batch_write(manifest)
+
+        self.assertEqual(result.total, 1)
+        self.assertEqual(result.succeeded, 1)
+        self.assertEqual(atomic_write_read(t1), 'from manifest')
+
+    def test_batch_partial_failure_does_not_rollback_success(self):
+        good = os.path.join(self.test_dir, 'good.txt')
+        bad_src = os.path.join(self.test_dir, 'does_not_exist.bin')
+        items = [
+            {'target': good, 'text': 'STILL HERE'},
+            {'target': os.path.join(self.test_dir, 'bad.txt'),
+             'file': bad_src},
+        ]
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            result = batch_write(items)
+
+        self.assertEqual(result.succeeded, 1)
+        self.assertEqual(result.failed, 1)
+        self.assertEqual(atomic_write_read(good), 'STILL HERE')
+
+    def test_batch_degraded_items_counted(self):
+        t1 = os.path.join(self.test_dir, 'degraded.txt')
+        items = [
+            {'target': t1, 'text': 'data'},
+        ]
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'No dir fsync')
+            result = batch_write(items)
+
+        self.assertEqual(result.degraded, 1)
+        self.assertEqual(result.succeeded, 0)
+        self.assertFalse(result.all_ok)
+        self.assertEqual(atomic_write_read(t1), 'data')
+
+    def test_batch_requires_target(self):
+        items = [{'text': 'missing target'}]
+        result = batch_write(items)
+        self.assertEqual(result.failed, 1)
+        self.assertIn('Missing "target"', result.items[0].error)
+
+    def test_batch_requires_text_or_file(self):
+        items = [{'target': os.path.join(self.test_dir, 'x.txt')}]
+        result = batch_write(items)
+        self.assertEqual(result.failed, 1)
+        self.assertFalse(result.all_ok)
+
+    def test_batch_binary_file(self):
+        src = os.path.join(self.test_dir, 'src.bin')
+        binary = b'\xde\xad\xbe\xef\x00'
+        with open(src, 'wb') as f:
+            f.write(binary)
+        dst = os.path.join(self.test_dir, 'dst.bin')
+        items = [
+            {'target': dst, 'file': src, 'binary': True},
+        ]
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            result = batch_write(items)
+
+        self.assertEqual(result.succeeded, 1)
+        with open(dst, 'rb') as f:
+            self.assertEqual(f.read(), binary)
+
+    def test_batch_invalid_manifest(self):
+        manifest = self._manifest_path({'not': 'a list'})
+        with self.assertRaises(ValueError):
+            batch_write(manifest)
+
+    def test_cli_batch_all_success(self):
+        t1 = os.path.join(self.test_dir, 'cba.txt')
+        t2 = os.path.join(self.test_dir, 'cbb.txt')
+        manifest = self._manifest_path([
+            {'target': t1, 'text': 'a'},
+            {'target': t2, 'text': 'b'},
+        ])
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main(['batch', manifest])
+        self.assertEqual(exit_code, EXIT_SUCCESS)
+
+    def test_cli_batch_partial_failure(self):
+        good = os.path.join(self.test_dir, 'cb_good.txt')
+        manifest = self._manifest_path([
+            {'target': good, 'text': 'ok'},
+            {'target': os.path.join(self.test_dir, 'cb_bad.txt'),
+             'file': '/nonexistent'},
+        ])
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main(['batch', manifest])
+        self.assertEqual(exit_code, EXIT_PARTIAL_BATCH_FAILURE)
+        self.assertEqual(atomic_write_read(good), 'ok')
+
+    def test_cli_batch_total_failure(self):
+        manifest = self._manifest_path([
+            {'target': 'a', 'file': '/nope'},
+            {'target': 'b', 'file': '/nada'},
+        ])
+        exit_code = main(['batch', manifest])
+        self.assertEqual(exit_code, EXIT_TOTAL_BATCH_FAILURE)
+
+    def test_cli_batch_json_output(self):
+        import json as json_lib
+        t1 = os.path.join(self.test_dir, 'cbj.txt')
+        manifest = self._manifest_path([
+            {'target': t1, 'text': 'json result'},
+        ])
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            with mock.patch('sys.stdout', new_callable=io.StringIO) as mock_out:
+                exit_code = main(['batch', manifest, '--json'])
+        self.assertEqual(exit_code, EXIT_SUCCESS)
+        parsed = json_lib.loads(mock_out.getvalue())
+        self.assertEqual(parsed['total'], 1)
+        self.assertEqual(parsed['succeeded'], 1)
+        self.assertEqual(len(parsed['items']), 1)
+
+    def test_batch_target_modified_flag_on_post_rename_failure(self):
+        t1 = os.path.join(self.test_dir, 'btm.txt')
+        with open(t1, 'w') as f:
+            f.write('OLD')
+        items = [
+            {'target': t1, 'text': 'NEW'},
+        ]
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Dir fsync')
+            result = batch_write(items, strict=True)
+
+        self.assertEqual(result.failed, 1)
+        self.assertTrue(result.items[0].target_modified)
+        self.assertEqual(atomic_write_read(t1), 'NEW')
 
 
 if __name__ == '__main__':

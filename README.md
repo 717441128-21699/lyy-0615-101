@@ -6,259 +6,322 @@
 
 ---
 
-## 安装与使用
+## 快速索引
 
-### 安装（推荐）
+- [安装与 CLI 入口](#安装与-cli-入口)
+- [子命令速览](#子命令速览)
+- [1. 单文件写入 (write)](#1-单文件写入-write)
+- [2. 诊断 (doctor)](#2-诊断-doctor)
+- [3. 预检/预演 (--check / --dry-run)](#3-预检--dry-run---check---dry-run)
+- [4. 批量写入 (batch)](#4-批量写入-batch)
+- [退出码总表](#退出码总表)
+- [常见场景选择指南](#常见场景选择指南)
+- [核心原理详解](#核心原理详解)
+- [严格模式的失败分类](#严格模式的失败分类)
+- [API 参考](#api-参考)
+
+---
+
+## 安装与 CLI 入口
 
 ```bash
-# 在项目目录下安装，之后可直接敲 atomic-write 命令
+# 安装后可直接敲 atomic-write
 pip install .
 
-# 验证安装
-atomic-write --check /tmp/test.txt
+# 验证
+atomic-write doctor
 ```
 
-安装后 `atomic-write` 命令可直接在终端使用，无需 `python -m`。
-
-### 不安装直接运行
-
+不安装的替代方式：
 ```bash
-# 方式 1：python -m
-python -m atomic_file config.json --text '{"key": "value"}'
-
-# 方式 2：直接运行（需要 python 在 PATH 中，且文件有 .py 扩展名）
-python atomic_file.py config.json --text '{"key": "value"}'
-
-# 方式 3（Linux/macOS）：创建别名
-alias atomic-write="python /path/to/atomic_file.py"
+python -m atomic_file doctor
+python atomic_file.py doctor .
 ```
 
 ---
 
-## 快速开始
+## 子命令速览
 
-### 命令行使用
+| 子命令 | 作用 | 典型用途 |
+|--------|------|---------|
+| `write` (默认，可省略) | 原子写入单个文件 | 日常配置写入、日志轮转 |
+| `doctor` | 诊断当前/指定目录的崩溃安全能力 | CI 启动预检、部署检查 |
+| `batch` | 从 JSON 清单一次写入多个目标文件 | 部署时批量更新配置、应用配置清单 |
 
 ```bash
-# 写入文本
+# 显式子命令
+atomic-write write config.json --text '{}'
+# 等价于默认形式（推荐省略，更简洁）
+atomic-write config.json --text '{}'
+```
+
+---
+
+## 1. 单文件写入 (write)
+
+### 基础用法
+
+```bash
+# 直接文本
 atomic-write config.json --text '{"key": "value"}'
 
-# 从另一个文件安全替换
+# 从源文件安全替换
 atomic-write production.sql --file /tmp/new_schema.sql
 
-# 从 stdin 读取
+# 从 stdin 管道
 cat large_dump.json | atomic-write output.json --file -
 
-# 严格模式（任何 fsync 失败都算错误）
-atomic-write important.db --file new_data.bin --strict
-
-# 不允许降级（目录 fsync 失败直接报错）
-atomic-write data.txt --text "hello" --no-degraded
+# 二进制 + 权限
+atomic-write snapshot.db --file /tmp/snap.db --binary --permissions 640
 ```
 
-### 预检 / 预演
+### 严格模式 vs 默认模式
 
-在实际写入前，先检测目标路径的崩溃安全能力：
+| 模式 | 目录 fsync 失败时行为 | 适用 |
+|------|----------------------|------|
+| **默认** | 降级成功，退出码 2，提示警告 | 多数应用：写入成功比完美保证更重要 |
+| `--no-degraded` | 报错退出码 4，明确说明内容已替换但缺目录 fsync | 想要知道每一步是否 100% 完成 |
+| `--strict` | 同上，退出码 4 | 最严格场景 |
+
+⚠️ **退出码 4 的准确含义**：
+> 文件内容 **已经替换成功**（rename 已原子完成），临时文件 fsync 也成功（数据块在磁盘上）。**唯一缺失**是目录项 fsync——如果**立刻断电**，重启后目录项可能回滚。如果不立刻断电，操作系统几秒内就会把目录项刷盘，之后就完全安全。**绝对不能**在退出码 4 时说"旧文件未变"。
+
+详见 [严格模式的失败分类](#严格模式的失败分类)。
+
+---
+
+## 2. 诊断 (doctor)
+
+在 CI 启动或部署前跑一次，明确告诉你这个目录的崩溃安全承诺等级。
 
 ```bash
-# 只检查（不改文件）
-atomic-write --check /path/to/config.json
+# 诊断当前目录
+atomic-write doctor
 
-# 预演（检查 + 模拟写入结果）
-atomic-write --dry-run config.json
+# 诊断指定目录
+atomic-write doctor /path/to/config/dir
+
+# CI 友好模式（只看退出码）
+atomic-write doctor . --quiet
+if [ $? -ne 0 ]; then
+  echo "::warning::Directory does not support full crash-safety, writes will be degraded"
+fi
+
+# 机器可读 JSON
+atomic-write doctor . --json
 ```
 
-输出示例：
-
+**输出示例**：
 ```
-Crash-safety check for: /home/user/config.json
-  Parent directory: /home/user
-  Parent directory exists: YES
-  Same filesystem: YES (rename will be atomic)
-  Directory fsync: NOT SUPPORTED ([Errno 5] FlushFileBuffers failed ...)
-  Crash-safety level: DEGRADED
-  Missing guarantees: directory fsync not supported (directory entry may not persist after rename)
-  WARNING: Directory fsync not supported: ...
+Crash-safety diagnosis for: D:\project\configs
+Platform: win32
 
-Dry-run result: Write would succeed in DEGRADED mode (exit code 2)
-```
+✓ Parent directory exists: D:\project\configs
+✓ Same-filesystem atomic rename: PASS: rename() will be atomic within the directory
+✗ Directory fsync (entry persistence): FAIL: [Errno 5] FlushFileBuffers failed...
+✓ Stdin reading support: Available (can use --file -)
+✓ Temp file creation: Can create temp files in D:\project\configs
 
-### 退出码语义
-
-| 退出码 | 含义 | 目标文件状态 | 崩溃安全承诺 |
-|--------|------|-------------|-------------|
-| 0 | 成功，全部 fsync 完成 | 已替换为新内容 | **完整**：断电也不会损坏 |
-| 1 | 写入失败（rename 之前出错） | **未修改**，仍是旧内容 | 无（但旧内容完好） |
-| 2 | 写入成功但降级 | 已替换为新内容 | **部分**：不半写，但断电可能回滚到旧内容 |
-| 3 | 参数错误 | 未修改 | — |
-| 4 | 部分完成（rename 已执行但目录 fsync 失败，strict/no-degraded 模式） | **已替换为新内容** | **缺失**：目录项未持久化，断电可能回滚 |
-
-> ⚠️ 退出码 4 是一个特殊状态：内容已经替换成功了，但目录项的 fsync 失败。
-> 此时 **不能** 说"旧文件不变"——文件确实已经是新内容，只是如果立即断电，目录项可能回滚。
-
-### Python API 使用
-
-```python
-from atomic_file import atomic_write, atomic_write_read, check_crash_safety
-
-# 预检
-check = check_crash_safety('config.json')
-print(f'Fully crash-safe: {check.would_be_fully_crash_safe}')
-print(f'Dir fsync supported: {check.dir_fsync_supported}')
-print(f'Same filesystem: {check.same_filesystem}')
-
-# 写入
-result = atomic_write('config.json', '{"key": "value"}')
-print(f'Success: {result.success}')
-print(f'Fully crash-safe: {result.fully_crash_safe}')
-print(f'Rename done: {result.renamed}')
-print(f'Temp fsync: {result.temp_file_fsync}')
-print(f'Dir fsync: {result.dir_fsync}')
-
-# 读取（便捷函数）
-content = atomic_write_read('config.json')
+Overall: Degraded mode expected. Missing/failing capabilities: Directory fsync...
 ```
 
-**返回值 `AtomicWriteResult` 字段：**
+**doctor 检查的能力**：
+1. 父目录是否存在
+2. 同一文件系统（rename 能否原子）
+3. 目录 fsync 支持性（能否完全持久化目录项）
+4. stdin 可用性
+5. 临时文件创建权限
 
-```python
-AtomicWriteResult(
-    success: bool,                  # 目标文件是否已更新
-    fully_crash_safe: bool,         # 是否完成全部 fsync 步骤
-    temp_file_fsync: str,           # 临时文件 fsync 状态
-    dir_fsync: str,                 # 父目录 fsync 状态
-    renamed: bool,                  # rename 是否已完成（区分 rename 前后的失败）
-    warnings: List[str],            # 降级/跨 FS 等警告信息
-    target_path: Path,              # 写入的目标文件绝对路径
-)
+**CI 退出码**：
+| 退出码 | 含义 |
+|--------|------|
+| 0 | 全部能力可用，完整崩溃安全 |
+| 2 | 部分能力缺失，降级模式（可写但需注意风险） |
+
+---
+
+## 3. 预检 / 预演 (--check / --dry-run)
+
+**`--check`**：只检测崩溃安全能力，不处理输入。
+
+**`--dry-run`**：接近真实写入——校验输入、权限设置、预测是完整安全还是降级，但**不改目标文件**。
+
+```bash
+# 只检查目录能力
+atomic-write --check config.json
+
+# 预演：检查文本编码、权限、预测结果
+atomic-write --dry-run config.json --text '{"key": "value"}' --permissions 644
+
+# 预演：检查源文件是否存在、大小、编码
+atomic-write --dry-run data.bin --file /tmp/source.bin --binary
 ```
 
-**预检结果 `CheckResult` 字段：**
-
-```python
-CheckResult(
-    target_path: Path,              # 目标文件绝对路径
-    parent_dir: Path,               # 父目录绝对路径
-    parent_dir_exists: bool,        # 父目录是否存在
-    same_filesystem: Optional[bool],# 同一文件系统？None=无法判断
-    dir_fsync_supported: Optional[bool], # 父目录 fsync 支持？None=未测试
-    dir_fsync_error: Optional[str], # fsync 失败时的错误信息
-    would_be_fully_crash_safe: bool,# 能否达到完全崩溃安全
-    warnings: List[str],            # 警告信息
-)
+**`--dry-run` 输出示例**：
 ```
+Dry-run for target: D:\project\config.json
+  [Crash safety]
+    Parent dir exists  : YES
+    Same filesystem    : YES (atomic rename)
+    Directory fsync    : NOT SUPPORTED → [Errno 5] ...
+  [Input validation]
+    ✓ Input --text (encoding=utf-8): OK: 18 bytes would be written
+    ✓ Permissions      : 0o644
+  [Prediction]
+    Write outcome      : DEGRADED success (exit 2), missing: dir fsync → degraded mode
+    Target file        : WOULD NOT be modified
+
+Dry-run complete. No files were modified.
+```
+
+---
+
+## 4. 批量写入 (batch)
+
+从 JSON 清单一次写入多个目标文件，每个独立执行原子写入，失败不影响已成功的项。
+
+### 清单格式 (manifest.json)
+
+```json
+[
+  {"target": "config/app.json",
+   "text": "{\"port\": 8080}",
+   "permissions": 420},
+
+  {"target": "data/snapshot.db",
+   "file": "/tmp/snap.db",
+   "binary": true},
+
+  {"target": "docs/readme_cn.txt",
+   "file": "/tmp/README.md",
+   "encoding": "gbk"}
+]
+```
+
+字段：
+- `target` (str, 必需)：目标路径
+- `text` (str)：直接写文本
+- `file` (str)：从文件读取；与 `text` 二选一
+- `encoding` (str, 默认 utf-8)：文本编码
+- `binary` (bool, 默认 false)：二进制模式（仅与 `file` 同用）
+- `permissions` (int)：八进制权限数值（如 `0o644` = 420）
+
+### 执行
+
+```bash
+# 标准执行
+atomic-write batch manifest.json
+
+# 严格模式（每个文件的目录 fsync 失败都算该项失败）
+atomic-write batch manifest.json --strict
+
+# 机器可读
+atomic-write batch manifest.json --json
+
+# CI 中只关心退出码
+atomic-write batch manifest.json --quiet
+rc=$?
+```
+
+**输出示例**：
+```
+Batch result: total=3  succeeded=1  degraded=1  failed=1
+  ✓ [success ]     18B [    safe] → config/app.json
+  ~ [degraded]  10240B [degraded] → data/snapshot.db
+  ✗ [failed  ]      0B [     N/A] → docs/readme_cn.txt
+         error: ValueError: invalid encoding 'gbk'
+         NOTE: target was NOT modified
+```
+
+**批量退出码**：
+| 退出码 | 含义 |
+|--------|------|
+| 0 | 全部完全成功（无降级无失败） |
+| 5 | 部分成功（有失败或有降级）—— CI 中可视为失败 |
+| 6 | 全部失败 |
+
+批量操作**不会回滚已成功的项**——这是设计选择：每个目标都是独立的原子操作，完成了就持久化。
+
+---
+
+## 退出码总表
+
+| 码 | 常量名 | 含义 | 目标文件状态 |
+|----|--------|------|-------------|
+| 0 | `EXIT_SUCCESS` | 成功，全部 fsync 完成 | 已替换，完全崩溃安全 |
+| 1 | `EXIT_WRITE_FAILED` | **rename 之前**失败 | **未修改**，仍是旧内容 |
+| 2 | `EXIT_DEGRADED_SUCCESS` | 成功但降级 | 已替换，目录项 fsync 缺失 |
+| 3 | `EXIT_INVALID_ARGS` | 参数错误 | 未修改 |
+| 4 | `EXIT_POST_RENAME_FAILURE` | **rename 已完成**、目录 fsync 失败、且 strict/no-degraded | **已替换**，但目录项未持久化 |
+| 5 | `EXIT_PARTIAL_BATCH_FAILURE` | 批量：部分成功/部分失败 | 各目标独立 |
+| 6 | `EXIT_TOTAL_BATCH_FAILURE` | 批量：全部失败 | 各目标独立 |
 
 ---
 
 ## 常见场景选择指南
 
-不同场景对崩溃安全的承诺等级要求不同。下表帮你选择正确的调用方式。
+| 场景 | 推荐调用 | 承诺等级 |
+|------|---------|---------|
+| **配置文件更新** | `atomic-write config.json --file new.json` | ✅ 不半写；Linux 完整安全 / Windows 降级 |
+| **小数据库快照** | `atomic-write snapshot.db --file tmp.db --strict` | ✅ 不半写 ✅ 退出码 0/4 明确分开 |
+| **日志轮转** | `atomic-write current.log --file rotated.log` | ✅ 不半写 ⚠️ 降级可接受 |
+| **部署预检** | `atomic-write doctor /config --quiet` | 0 或 2 决定部署策略 |
+| **批量配置更新** | `atomic-write batch changes.json` | 每文件独立；退出码 5/6 触发告警 |
 
-### 场景与承诺等级
-
-| 场景 | 风险容忍度 | 推荐调用 | 能承诺什么 |
-|------|-----------|---------|-----------|
-| **配置文件更新** | 不能丢配置，也不能损坏 | `atomic-write config.json --file new.json` | ✅ 不半写 ✅ 断电后目录项落盘（如果 fsync 支持） |
-| **小数据库快照** | 一个快照都不能丢 | `atomic-write snapshot.db --file tmp.db --strict` | ✅ 不半写 ✅ 要么完整要么报错（退出码 4 = 快照已写入但未 100% 落盘） |
-| **日志轮转** | 丢一条日志可接受 | `atomic-write current.log --file rotated.log` | ✅ 不半写（日志不会损坏） ⚠️ 降级模式下断电可能丢最后一条 |
-| **跨分区写文件** | 必须 atomic | — | ❌ 跨文件系统 rename 非原子，**无法保证**，应先写同分区再移动 |
-| **网络驱动器** | 取决于协议 | `atomic-write file.txt --text "data" --check 先测` | ⚠️ SMB/NFS 的 fsync 语义取决于服务端实现 |
-
-### 各场景详细说明
-
-#### 1. 配置文件更新
-
-配置文件通常较小、更新不频繁，但**绝对不能损坏**——损坏意味着服务无法启动。
+### 配置文件
 
 ```bash
-# 标准方式（推荐）
+# 标准方式
 atomic-write /etc/myapp/config.json --file /tmp/new_config.json
-
-# Python
-result = atomic_write('/etc/myapp/config.json', new_config_text)
-if result.is_degraded:
-    # 记录日志，但不必 panic——配置已经写入了，只是断电可能回滚
-    log.warning(f'Config written in degraded mode: {result.warnings}')
+# 退出码 0/2 → 写入成功，根据退出码决定是否告警
 ```
 
-**承诺等级**：
-- Linux ext4/xfs 上：**完整崩溃安全**（退出码 0）
-- Windows NTFS 上：通常是**降级**（退出码 2），因为目录 fsync 可能不支持
-- 降级模式下：配置不会半写损坏，但如果在写入后几秒内断电，可能回滚到旧配置
+**承诺**：绝不会半写损坏。Linux ext4/xfs 通常完整安全，Windows NTFS 通常降级。
 
-#### 2. 小数据库快照
-
-数据库快照是定期保存的全量状态，**宁可报错也不能写入半截数据**。
+### 数据库快照
 
 ```bash
-# 严格模式：任何 fsync 失败都算错误
 atomic-write /data/snapshot.db --file /tmp/snapshot.tmp --strict
+case $? in
+  0) echo "Snapshot safely persisted" ;;
+  4) echo "Snapshot written but dir fsync skipped; WAIT 5s before power-cycling!" ;;
+  1) echo "Snapshot FAILED, old snapshot intact, retry!" ;;
+  *) echo "Unknown error" ;;
+esac
 ```
 
-```python
-try:
-    result = atomic_write('/data/snapshot.db', snapshot_data, strict=True)
-except OSError as e:
-    # 两种情况：
-    # 1. rename 前失败：旧快照完好，可以重试
-    # 2. rename 后目录 fsync 失败（退出码 4）：
-    #    新快照已写入，但目录项可能未落盘
-    if result.renamed:
-        # 快照数据确实已经替换成功了
-        # 只是断电保护不完全
-        log.error(f'Snapshot written but dir fsync failed: {e}')
-    else:
-        # 旧快照完好，可以安全重试
-        log.error(f'Snapshot write failed, old data intact: {e}')
-```
+**退出码 4 的处理**：不要重试——快照已经替换了！只要不立刻断电就安全。通常 sleep 几秒让 OS 刷目录项即可。
 
-**承诺等级**：
-- 退出码 0：**完整崩溃安全**，快照断电不丢
-- 退出码 1：旧快照完好，可安全重试
-- 退出码 4：快照**已替换**为新内容，但目录项 fsync 缺失，断电可能回滚到旧快照
-
-#### 3. 日志轮转
-
-日志轮转的核心需求是**日志文件不损坏**，丢最后几条日志可以接受。
+### 日志轮转
 
 ```bash
-# 默认模式即可——不半写最重要，降级可接受
-atomic-write /var/log/app/current.log --file /var/log/app/rotated.log
+atomic-write /var/log/app/current.log --file /tmp/rotated.log
+# 退出码 2 也没关系，日志不会损坏
 ```
 
-**承诺等级**：
-- ✅ **不半写**：即使降级模式，rename 仍然原子，日志文件不会损坏
-- ⚠️ **降级风险**：如果目录 fsync 不支持，断电后最后一条日志的轮转可能丢失
-- 日志场景下这个风险完全可接受
+### CI 部署预检
 
-#### 4. 跨分区场景
+```yaml
+# GitHub Actions 示例
+- name: Check config dir crash-safety
+  run: |
+    atomic-write doctor /etc/myapp --quiet
+    if [ $? -eq 2 ]; then
+      echo "::warning::Directory /etc/myapp doesn't fully support crash-safe writes"
+    fi
+```
 
-如果临时文件和目标文件在不同分区/挂载点，**rename 不是原子的**，本工具无法保证崩溃安全。
+### 批量配置更新
 
 ```bash
-# 先检查
-atomic-write --check /other_partition/data.txt
-# 输出: Same filesystem: NO (rename will be copy+unlink, NOT atomic!)
-
-# 正确做法：先写到同分区，再用 mv 移动
-atomic-write /tmp/data.txt --file new_data.bin
-mv /tmp/data.txt /other_partition/data.txt
+atomic-write batch deploy_changes.json
+# 退出码 5 意味着至少 1 项失败或降级
+if [ $? -eq 5 ]; then
+  atomic-write batch deploy_changes.json --json > /tmp/last_batch.json
+  echo "Some items failed! See /tmp/last_batch.json"
+  exit 1
+fi
 ```
-
-#### 5. 网络驱动器（SMB/NFS）
-
-```bash
-# 先预检，看服务端是否支持 fsync
-atomic-write --check /mnt/nfs_share/data.txt
-
-# NFS: 通常支持 fsync，但取决于服务端 mount 选项（sync vs async）
-# SMB/CIFS: 取决于服务端实现，Windows SMB 通常支持
-```
-
-**承诺等级**：
-- NFS `sync` 模式：通常**完整崩溃安全**
-- NFS `async` 模式：**降级**（服务端可能缓存写入）
-- SMB：取决于服务端，用 `--check` 预检
 
 ---
 
@@ -266,186 +329,90 @@ atomic-write --check /mnt/nfs_share/data.txt
 
 ### 问题：为什么直接覆盖写不安全？
 
-考虑 `open("f", "w").write(NEW_BYTES)`：
-
 ```
-应用 write() → 内核页缓存(Page Cache) → pdflush 异步刷盘 → 磁盘控制器缓存 → 物理介质
+应用 write() → 内核页缓存 → pdflush 异步刷盘 → 磁盘控制器缓存 → 物理介质
 ```
 
-在中间**任意一步断电**，文件可能处于：
-- 大小为 0（truncate 完成但数据未写）
-- 半截（写了前 50KB 后面没写）
-- 某些块是新数据某些块是旧数据
+中间任意一步断电 → 文件半截、大小为 0、或块部分更新 → **既不是旧也不是新**。
 
-**文件既不是旧内容也不是新内容——损坏。**
+### 四步原子写入协议
+
+```
+① mkstemp(dir=父目录)      在同一目录建临时文件→同 FS→rename 原子
+② write(data)              全部数据写入临时文件
+③ fsync(临时文件)          数据块+inode 落盘 → 防 write/rename 之间断电
+④ os.replace → rename      原子切换 inode 指针 → 任何时刻要么旧要么新
+⑤ fsync(父目录)            目录项落盘 → 防 rename/返回之间断电
+⑥ finally 清理              任一步失败删临时文件
+```
+
+### rename 原子性（同一 FS 内）
+
+POSIX 规定：`rename()` 对观察者是原子的——任何时刻要么看到旧文件要么看到新文件，没有中间态。实现上：
+- 拿父目录 inode 锁
+- 在一个日志事务（ext4 jbd2/xfs 日志）内：删旧目录项、加新目录项、改硬链接计数
+- 事务整体提交或回滚
+
+**前提（极其重要）**：源和目标必须在**同一挂载点**。跨 FS 时，Linux 内核会静默退化成 copy+unlink，完全非原子。
+
+### 临时文件 fsync 的作用
+
+```
+write(tmp) → [崩溃] → rename → fsync(dir)
+```
+断电时刻在 write 完成但 fsync 未做 → inode 指向的块是旧垃圾/全零 → 内容损坏。
+
+### 父目录 fsync 的作用
+
+```
+write(tmp) → fsync(tmp) → rename → [崩溃] → fsync(dir)
+```
+断电时刻在 rename 返回但 fsync(dir) 未做 → 目录项在 Page Cache → 重启后目录项回滚 → 新建文件"消失"、覆盖写回退到旧内容。
+
+### 各步骤防御崩溃时刻汇总
+
+| 步骤 | 漏掉后最坏后果 |
+|------|---------------|
+| mkstemp(dir=parent) | 跨 FS → rename 退化为 copy+unlink → 中途崩溃损坏 |
+| fsync(临时文件) | inode 指向垃圾块 → rename 后文件**内容损坏** |
+| rename | 本身保证原子，无中间态 |
+| fsync(父目录) | 目录项回滚 → 文件"消失"或回滚到旧内容 |
 
 ---
 
-### 解决方案：四步原子写入协议
+## 严格模式的失败分类
 
-```
-时间轴 ──────────────────────────────────────────────────────────────────────►
-  │
-  ① mkstemp(dir=父目录) ── 在目标文件**同一目录**创建临时文件
-  │                         ★ 必须同一目录 → 同一文件系统 → rename 才能原子
-  │
-  ② write(全部数据) ─────── 把新内容写入临时文件
-  │
-  ③ fsync(临时文件 fd) ─── 强制：数据块 + inode 元数据（大小、mtime）刷到物理介质
-  │
-  ④ close(临时文件) ─────── 关闭 fd
-  │
-  ⑤ os.replace(tmp, target)  同一文件系统内的 rename() 系统调用
-  │
-  ⑥ fsync(父目录 fd) ───── 对父目录执行 fsync，确保目录项持久化
-  │
-  ⑦ finally 清理 ───────── 任一步骤失败则删除临时文件
-```
+`atomic_write()` 抛出的 `AtomicWriteError` 带有 `phase` 字段和 `target_modified` 属性，调用者能精确分类。
 
----
+### 两种失败阶段
 
-### 关键问题 1：为什么同一文件系统内的 rename 是原子的？
+| 阶段 | `FailPhase` | 退出码 | 含义 | `target_modified` |
+|------|-------------|--------|------|-------------------|
+| **前** rename | `BEFORE_RENAME` | 1 | mkstemp / write / fsync(tmp) / rename 自身 等步骤失败 | `False` —— 旧内容完全完好 |
+| **后** rename | `AFTER_RENAME` | 4 | 只有目录项 fsync 失败 | `True` —— 新内容已经替换 |
 
-**POSIX SUSv4 标准明确规定：**
+**对应终端提示**：
+- BEFORE_RENAME：`Target file was NOT modified (still contains old content).`
+- AFTER_RENAME：
+  ```
+  IMPORTANT: The target file HAS been replaced with new content, but directory entry fsync failed.
+  Temporary file fsync succeeded (data blocks are on disk).
+  Risk: if power fails NOW, directory entry may revert, causing the file to appear as old content or disappear.
+  ```
 
-> "If `rename()` fails, neither old nor new shall be modified in any observable way."
-> "The `rename()` function shall be atomic with respect to the visibility of the resulting directory entry."
+### 精确到每一步的失败（API 级别）
 
-**实现层面（以 ext4/xfs 为例）：**
+[AtomicWriteError.phase](file:///d:/trae-bz/TraeProjects/101/atomic_file.py#L51-L54) 在错误消息里明确标出错在哪一步：
 
-rename 只修改**目录项中的文件名→inode 指针**，不移动任何数据块：
+| 场景 | `AtomicWriteError.phase` | 对应提示前缀 |
+|------|--------------------------|-------------|
+| 临时文件创建失败 | BEFORE_RENAME | `Failed to create temporary file:` |
+| 临时文件 write 失败 | BEFORE_RENAME | `Failed to write/flush temporary file:` |
+| **临时文件 fsync 失败** | BEFORE_RENAME | **`Failed to fsync temporary file (data may not be persisted):`** |
+| rename 自身失败 | BEFORE_RENAME | `Failed to rename temp file to target:` |
+| **目录项 fsync 失败** | **AFTER_RENAME** | **`Directory fsync failed (strict mode):`** |
 
-1. 取得父目录的 inode 锁
-2. 在同一个 **日志事务（jbd2）** 内做三件事：
-   - 删除旧目录项（如果 target 已存在）
-   - 增加新目录项（`tmp` → inode）
-   - 旧 target 的 inode 硬链接数减一，tmp inode 不变
-3. 事务要么整体 commit，要么整体回滚
-4. 对观察者：任何时刻要么看到旧文件，要么看到新文件，不存在中间状态
-
-**⚠️ 关键前提：源和目标必须在同一挂载点（同一文件系统）。**
-
-如果跨文件系统调用 rename，Linux 内核会**静默地将其退化成 `copy + unlink`**：
-- 先把 tmp 文件的所有数据块复制到 target 所在文件系统
-- 再删除 tmp
-- 这个过程**完全不是原子的**，中途崩溃会留下损坏的 target
-
-本工具通过 `_verify_same_filesystem()` 检测跨 FS 情况并发出警告。
-
----
-
-### 关键问题 2：为什么仅仅 rename 还不够，必须先 fsync 临时文件？
-
-```
-write(tmp) → [此处崩溃] → rename → fsync(dir)
-```
-
-**崩溃时刻 A：`write(tmp)` 完成但 `fsync(tmp)` 还没做，此时断电。**
-
-- `rename` 已经完成了 → 目标文件指向 tmp 的 inode
-- 但 tmp 的数据块还在 Page Cache 里，根本没刷到磁盘
-- 重启后：inode 存在，但它指向的数据块是旧垃圾（或者全零）
-- **结果：目标文件存在，但内容是损坏的**
-
-**`fsync(tmp)` 防御的就是这个崩溃时刻。** 它确保在 rename 之前，临时文件的所有数据和元数据（大小、权限）都已持久化到物理介质。
-
----
-
-### 关键问题 3：为什么 rename 之后还要 fsync 父目录？
-
-```
-write(tmp) → fsync(tmp) → rename → [此处崩溃] → fsync(dir)
-```
-
-**崩溃时刻 B：`rename` 系统调用返回到用户态，但 `fsync(dir)` 还没做，此时断电。**
-
-rename 操作修改了父目录的数据块（目录项），但这个修改也只是在 Page Cache 里，没刷到磁盘。
-
-重启后可能发生：
-
-| 场景 | 后果 |
-|------|------|
-| target 之前不存在（新建文件） | 目录里找不到 target → **看起来什么都没写过**。数据静静地躺在一个没有目录项指向的孤儿 inode 里 |
-| target 之前存在（覆盖写） | 目录项仍然指向**旧** inode → **应用读到旧内容**，以为写成功了但其实丢失了这次更新 |
-
-**`fsync(dir)` 防御的就是这个崩溃时刻。** 它确保目录项的修改（rename 产生的）持久化到磁盘。
-
-> **经典踩坑案例：** RethinkDB、早期 SQLite、Redis AOF 都曾因为漏掉目录 fsync 导致崩溃后数据"消失"。
-
----
-
-### 各步骤防御崩溃时刻汇总表
-
-| 步骤 | 操作 | 防御的崩溃时刻 | 漏掉后的最坏后果 |
-|------|------|----------------|------------------|
-| ① | mkstemp(dir=parent_dir) | — | 跨文件系统 → rename 变成 copy+unlink **非原子**，中途崩溃损坏文件 |
-| ② | write(数据) | — | （这一步崩溃不影响旧文件，只留下半写的临时文件，会被 finally 清理） |
-| ③ | **fsync(临时文件)** | ② 与 ⑤ 之间断电 | inode 指向的块是旧垃圾/零 → rename 后目标文件**内容损坏**（inode 对但数据块错） |
-| ④ | close(fd) | — | （多数 FS 不严格依赖，但某些网络 FS 需要 close 才释放锁） |
-| ⑤ | rename(tmp, target) | ⑤ 执行中途断电 | **rename 本身保证原子性**：要么全完成要么全不做，无中间状态 |
-| ⑥ | **fsync(父目录)** | ⑤ 与 ⑦ 之间断电 | 目录项回滚到旧状态 → 新建文件"消失"、覆盖写**回滚到旧内容**（最隐蔽的 bug） |
-| ⑦ | finally unlink(tmp) | 任一步骤后正常异常 | 临时文件泄漏占用磁盘空间 |
-
----
-
-## 关于"降级模式"（Degraded Mode）
-
-### 什么时候会降级？
-
-降级发生在 **rename 成功但父目录 fsync 失败** 时。常见原因：
-
-- Windows 下 `FlushFileBuffers` 对某些文件系统/目录返回错误
-- FAT32、exFAT 不支持目录 fsync
-- SMB 网络共享的服务端不支持
-- NFS async 模式
-
-### 降级模式下的承诺
-
-降级模式**不是什么都没做**，它仍然提供了重要的保证：
-
-| 承诺 | 完整模式（退出码 0） | 降级模式（退出码 2） |
-|------|---------------------|---------------------|
-| 不会出现半写损坏 | ✅ 是 | ✅ 是 |
-| 数据已完整替换 | ✅ 是 | ✅ 是 |
-| 断电后目录项落盘 | ✅ 是 | ❌ 不能保证（可能回滚到旧内容） |
-
-### 本工具的处理策略
-
-| 模式 | 行为 | 适用场景 |
-|------|------|----------|
-| **默认 `allow_degraded=True`** | 返回 `fully_crash_safe=False`，退出码 2 | 大多数应用：写入成功比完美保证更重要 |
-| **`strict=True`** | 抛出 `OSError`，退出码 4 | 最严格场景：注意此时文件**已替换**，不是旧内容 |
-| **`--no-degraded`** | 同 strict，退出码 4 | 同上 |
-
-### strict/no-degraded 模式下目录 fsync 失败的准确含义
-
-这是最容易误解的点：
-
-```
-write(tmp) → fsync(tmp) ✅ → rename ✅ → fsync(dir) ❌
-```
-
-此时：
-1. **目标文件已被替换为新内容**（rename 已完成）
-2. 新内容的数据块已持久化到磁盘（fsync(tmp) 已完成）
-3. **缺失**：目录项的修改未持久化（fsync(dir) 失败）
-4. **风险**：如果**现在立即断电**，重启后目录项可能回滚，文件可能变回旧内容
-5. **如果不断电**：操作系统最终会把目录项刷盘，之后就和完整模式一样安全
-
-所以退出码 4 ≠ "写入失败" ≠ "旧文件不变"。它的准确含义是：
-**写入已成功，数据已在磁盘上，但崩溃安全的最后一步（目录项持久化）缺失，需要几秒钟让操作系统自动完成刷盘后才安全。**
-
----
-
-## 真实世界中的应用
-
-这套协议是工业界的标准做法，被用于：
-
-- **SQLite**：WAL 模式下的 checkpoint、master journal 写入
-- **LevelDB / RocksDB**：MANIFEST 文件更新、CURRENT 指针切换
-- **Redis**：AOF 和 RDB 的持久化切换
-- **ZooKeeper**：事务日志的原子更新
-- **大多数配置管理工具**：`etckeeper`、`consul` 等的配置文件写入
+可以看到——**临时文件 fsync 失败是 BEFORE_RENAME**（目标未修改），**只有目录 fsync 失败才是 AFTER_RENAME**（内容已替换）。这正是需求 3 要求的精确分类。
 
 ---
 
@@ -459,8 +426,6 @@ atomic_write(
     data: Union[bytes, str],
     encoding: Optional[str] = None,
     permissions: Optional[int] = None,
-    temp_suffix: str = '.tmp',
-    temp_prefix: str = '.~',
     allow_degraded: bool = True,
     strict: bool = False,
 ) -> AtomicWriteResult
@@ -469,32 +434,42 @@ atomic_write(
 ### `check_crash_safety()`
 
 ```python
-check_crash_safety(
-    target: Union[str, Path],
-) -> CheckResult
+check_crash_safety(target: Union[str, Path]) -> CheckResult
 ```
 
-### `atomic_write_read()`
+### `doctor()`
 
 ```python
-atomic_write_read(
-    path: Union[str, Path],
-    read_encoding: Optional[str] = 'utf-8',
-) -> Union[bytes, str]
+doctor(directory: Optional[Union[str, Path]] = None) -> DoctorResult
 ```
 
-### 命令行参数
+### `batch_write()`
 
+```python
+batch_write(
+    manifest: Union[str, Path, List[Dict]],
+    allow_degraded: bool = True,
+    strict: bool = False,
+) -> BatchResult
 ```
-atomic-write <target>
-    [--text CONTENT | --file SOURCE | --check | --dry-run]
-    [--encoding ENC]
-    [--binary]
-    [--permissions OCTAL]
-    [--strict]
-    [--no-degraded]
-    [--quiet]
+
+### 异常
+
+```python
+AtomicWriteError(
+    phase: str,            # 'before_rename' | 'after_rename'
+    message: str,
+    target_path: Optional[Path] = None,
+)
+# 属性: target_modified -> bool
 ```
+
+### 结果类型
+
+- `AtomicWriteResult` —— 单文件写入结果
+- `CheckResult` —— 单个目标预检结果
+- `DoctorResult` —— 目录诊断结果
+- `BatchResult` / `BatchItemResult` —— 批量结果
 
 ---
 
@@ -506,22 +481,13 @@ python test_atomic_file.py -v
 
 ---
 
-## 常见误区
+## 常见误区速查
 
-1. ❌ **"rename 已经原子了，不需要 fsync"**
-   → 漏掉 fsync(tmp) 会导致内容损坏
-
-2. ❌ **"fsync 了文件就够了，目录不用"**
-   → 漏掉 fsync(dir) 会导致更新"消失"
-
-3. ❌ **"strict 模式失败 = 旧文件不变"**
-   → 目录 fsync 失败时 rename 已经完成，**文件已替换为新内容**
-
-4. ❌ **"跨文件系统 rename 也原子吧？内核应该会处理"**
-   → 不会。跨 FS rename 退化成 copy+unlink，完全非原子
-
-5. ❌ **"Windows 下不用关心这个，NTFS 是事务性的"**
-   → NTFS 的元数据事务性只保证 rename 本身原子，但不保证 fsync 的语义，仍然需要显式刷盘
-
-6. ❌ **"降级模式 = 写入失败"**
-   → 降级模式下数据已完整写入，只是断电保护不如完整模式
+| ❌ 误区 | ✅ 事实 |
+|---------|---------|
+| "rename 原子了就不用 fsync" | 漏 fsync(tmp) → 内容损坏 |
+| "fsync 文件就够了，目录不用" | 漏 fsync(dir) → 目录项回滚 → 文件"消失" |
+| "strict 模式失败 = 旧文件不变" | 退出码 4 时 rename **已经完成**，内容已替换，只是缺目录项 fsync |
+| "跨 FS rename 也原子" | 内核退化为 copy+unlink，完全非原子 |
+| "降级模式 = 写入失败" | 降级模式下数据已完整写入，只是断电回滚保护不完整 |
+| "批量写入会全部回滚" | 每个文件独立原子操作，已成功的不回滚 |
