@@ -11,7 +11,6 @@
 import os
 import sys
 import tempfile
-import errno
 import argparse
 from pathlib import Path
 from typing import Union, Optional, NamedTuple, List
@@ -20,14 +19,15 @@ from typing import Union, Optional, NamedTuple, List
 __all__ = [
     'atomic_write',
     'atomic_write_read',
+    'check_crash_safety',
     'AtomicWriteResult',
+    'CheckResult',
     'FsyncStatus',
     'main',
 ]
 
 
 class FsyncStatus:
-    """fsync 操作的状态枚举"""
     NOT_ATTEMPTED = 'not_attempted'
     SUCCESS = 'success'
     FAILED_DEGRADED = 'failed_degraded'
@@ -43,6 +43,7 @@ class AtomicWriteResult(NamedTuple):
         fully_crash_safe: 是否完成了全部 fsync 步骤，提供完整崩溃安全承诺
         temp_file_fsync: 临时文件 fsync 的状态
         dir_fsync: 父目录 fsync 的状态
+        renamed: rename 是否已经完成（区分 rename 前后的失败）
         warnings: 非致命警告信息列表
         target_path: 最终写入的目标文件绝对路径
     """
@@ -50,29 +51,48 @@ class AtomicWriteResult(NamedTuple):
     fully_crash_safe: bool
     temp_file_fsync: str
     dir_fsync: str
+    renamed: bool
     warnings: List[str]
     target_path: Path
 
     @property
     def is_degraded(self) -> bool:
-        """是否以降级模式成功（写入成功但未完全保障崩溃安全）"""
         return self.success and not self.fully_crash_safe
+
+
+class CheckResult(NamedTuple):
+    """
+    --check / --dry-run 预检结果。
+
+    Fields:
+        target_path: 目标文件绝对路径
+        parent_dir: 父目录绝对路径
+        parent_dir_exists: 父目录是否存在
+        same_filesystem: 临时文件与目标是否在同一文件系统（None=无法判断）
+        dir_fsync_supported: 父目录是否支持 fsync（None=未测试）
+        dir_fsync_error: 如果 dir_fsync 测试失败，记录错误信息
+        would_be_fully_crash_safe: 如果真正写入，能否达到完全崩溃安全
+        warnings: 警告信息
+    """
+    target_path: Path
+    parent_dir: Path
+    parent_dir_exists: bool
+    same_filesystem: Optional[bool]
+    dir_fsync_supported: Optional[bool]
+    dir_fsync_error: Optional[str]
+    would_be_fully_crash_safe: bool
+    warnings: List[str]
 
 
 def _fsync_dir(dir_path: Union[str, Path]) -> str:
     """
-    对目录执行 fsync，确保目录项（包括重命名操作）持久化到磁盘。
-
-    **不再静默吞掉错误**：
-    - POSIX 系统：直接对目录 fd 调用 fsync，失败抛异常
-    - Windows 系统：通过 CreateFile + FlushFileBuffers 实现，失败抛异常
-      而不是 pass。让上层决定如何处理降级。
+    对目录执行 fsync，确保目录项持久化到磁盘。
 
     Returns:
         FsyncStatus 字符串
 
     Raises:
-        OSError: fsync 失败时抛出，由调用者决定是否降级处理
+        OSError: fsync 失败时抛出
     """
     dir_path = str(dir_path)
     if not os.path.isdir(dir_path):
@@ -144,17 +164,123 @@ def _fsync_dir(dir_path: Union[str, Path]) -> str:
 
 
 def _fsync_file(fd: int) -> str:
-    """
-    对文件 fd 执行 fsync，确保数据和元数据持久化。
-
-    Returns:
-        FsyncStatus 字符串
-
-    Raises:
-        OSError: fsync 失败时抛出
-    """
     os.fsync(fd)
     return FsyncStatus.SUCCESS
+
+
+def _check_same_filesystem(tmp_path: str, target_path: Path) -> Optional[bool]:
+    try:
+        tmp_stat = os.stat(tmp_path)
+        target_stat = os.stat(str(target_path)) if target_path.exists() else os.stat(str(target_path.parent))
+        return tmp_stat.st_dev == target_stat.st_dev
+    except OSError:
+        return None
+
+
+def _verify_same_filesystem(tmp_path: str, target_path: Path, warnings: List[str]) -> None:
+    result = _check_same_filesystem(tmp_path, target_path)
+    if result is False:
+        try:
+            tmp_dev = os.stat(tmp_path).st_dev
+            tgt_dev = os.stat(str(target_path)).st_dev if target_path.exists() else os.stat(str(target_path.parent)).st_dev
+            warnings.append(
+                f'Temporary file and target file are on different filesystems '
+                f'(st_dev={tmp_dev} vs {tgt_dev}). '
+                f'os.replace() will NOT be atomic and will fall back to copy+unlink, '
+                f'which means a mid-operation crash can leave a corrupted file. '
+                f'For true atomicity, ensure temp dir and target are on the same mount point.'
+            )
+        except OSError:
+            warnings.append(
+                'Unable to verify filesystem compatibility. '
+                'If temp and target are on different filesystems, rename will not be atomic.'
+            )
+
+
+def check_crash_safety(target: Union[str, Path]) -> CheckResult:
+    """
+    预检目标路径的崩溃安全能力，不真正写入文件。
+
+    检测：
+    1. 父目录是否存在
+    2. 临时文件与目标是否在同一文件系统
+    3. 父目录是否支持 fsync
+
+    Returns:
+        CheckResult
+    """
+    target = Path(target).resolve()
+    parent_dir = target.parent
+    warnings: List[str] = []
+
+    parent_exists = parent_dir.exists()
+    same_fs: Optional[bool] = None
+    dir_fsync_ok: Optional[bool] = None
+    dir_fsync_err: Optional[str] = None
+
+    if parent_exists:
+        try:
+            fd, tmp_path = tempfile.mkstemp(
+                suffix='.tmp',
+                prefix='.~check_',
+                dir=str(parent_dir),
+            )
+            try:
+                same_fs = _check_same_filesystem(tmp_path, target)
+                if same_fs is False:
+                    try:
+                        tmp_dev = os.stat(tmp_path).st_dev
+                        tgt_dev = os.stat(str(target)).st_dev if target.exists() else os.stat(str(parent_dir)).st_dev
+                        warnings.append(
+                            f'Different filesystems (st_dev={tmp_dev} vs {tgt_dev}). '
+                            f'Rename will NOT be atomic; mid-crash can corrupt the file.'
+                        )
+                    except OSError:
+                        warnings.append('Different filesystems detected. Rename will not be atomic.')
+            finally:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(tmp_path)
+                except OSError:
+                    pass
+        except OSError as e:
+            warnings.append(f'Cannot create temp file in parent directory: {e}')
+            same_fs = None
+
+        try:
+            _fsync_dir(parent_dir)
+            dir_fsync_ok = True
+        except OSError as e:
+            dir_fsync_ok = False
+            dir_fsync_err = str(e)
+            warnings.append(
+                f'Directory fsync not supported: {e}. '
+                f'After rename, if power fails before the OS flushes the directory entry, '
+                f'the file may revert to old content or disappear. '
+                f'Write will succeed but operate in DEGRADED mode.'
+            )
+    else:
+        warnings.append(f'Parent directory does not exist: {parent_dir} (will be auto-created on write)')
+
+    fully_safe = (
+        parent_exists
+        and same_fs is True
+        and dir_fsync_ok is True
+    )
+
+    return CheckResult(
+        target_path=target,
+        parent_dir=parent_dir,
+        parent_dir_exists=parent_exists,
+        same_filesystem=same_fs,
+        dir_fsync_supported=dir_fsync_ok,
+        dir_fsync_error=dir_fsync_err,
+        would_be_fully_crash_safe=fully_safe,
+        warnings=warnings,
+    )
 
 
 def atomic_write(
@@ -173,37 +299,18 @@ def atomic_write(
     算法步骤（每一步都防御特定的崩溃场景）：
     1. 解析目标路径，确保父目录存在
     2. 在目标文件 **同一目录** 下创建临时文件（保证同一文件系统，rename 才能原子）
-       ★ 关键前提：临时文件与目标文件必须在同一挂载点
-       ★ 跨文件系统的 rename 不是原子的（会退化成 copy+unlink）
     3. 将用户数据写入临时文件
     4. 对临时文件执行 fsync ──► 防御：写后 rename 前崩溃，临时文件数据丢失
     5. 关闭临时文件
     6. 执行原子 rename（同一文件系统内是原子的）──► 防御：rename 中途崩溃导致文件损坏
     7. 对父目录执行 fsync ──► 防御：rename 后目录项未持久化导致新文件"消失"
 
-    Args:
-        path: 目标文件路径
-        data: 要写入的数据，bytes 或 str
-        encoding: 当 data 为 str 时使用的编码，默认 utf-8
-        permissions: 新建文件的权限（如 0o644），None 则使用系统默认
-        temp_suffix: 临时文件名后缀
-        temp_prefix: 临时文件名前缀
-        allow_degraded: 如果目录 fsync 失败（比如 Windows 下某些 FS 不支持），
-            是否允许以降级模式返回（写入成功但不保证完全崩溃安全）。
-            True 则返回降级结果；False 则抛出异常。
-        strict: 严格模式。如果为 True，任何 fsync 失败都直接抛出异常，不回退。
-            此参数优先级高于 allow_degraded。
-
-    Returns:
-        AtomicWriteResult: 包含每一步的成功状态、是否完全崩溃安全、警告信息
-
     Raises:
         OSError: 底层文件操作失败时抛出。
-            - 在 rename 之前发生的异常：保证目标文件不变（仍是旧内容）
-            - 在 rename 之后但目录 fsync 之前的异常：
-              * 如果 strict=True：抛出异常，此时目标文件已经更新但可能未完全持久化
-              * 如果 strict=False 且 allow_degraded=True：返回降级结果，不抛出
-              * 如果 strict=False 且 allow_degraded=False：抛出异常
+            - rename 之前的异常：目标文件不变（仍是旧内容）
+            - rename 之后目录 fsync 的异常：
+              strict=True 或 allow_degraded=False 时抛出，
+              此时目标文件**已经被替换为新内容**，但目录项可能未持久化到磁盘。
     """
     path = Path(path).resolve()
     parent_dir = path.parent
@@ -223,6 +330,7 @@ def atomic_write(
     tmp_path = None
     temp_fsync_status = FsyncStatus.NOT_ATTEMPTED
     dir_fsync_status = FsyncStatus.NOT_ATTEMPTED
+    renamed = False
 
     try:
         fd, tmp_path = tempfile.mkstemp(
@@ -251,27 +359,43 @@ def atomic_write(
             try:
                 os.chmod(tmp_path, permissions)
             except NotImplementedError:
-                warnings.append(f'chmod not supported on this platform, permissions not set')
+                warnings.append('chmod not supported on this platform, permissions not set')
 
         os.replace(tmp_path, str(path))
         tmp_path = None
+        renamed = True
 
         try:
             dir_fsync_status = _fsync_dir(parent_dir)
         except OSError as e:
             if strict:
-                warnings.append(f'Directory fsync failed: {e}')
+                dir_fsync_status = FsyncStatus.FAILED_DEGRADED
+                warnings.append(
+                    f'Directory fsync failed (strict mode): {e}. '
+                    f'IMPORTANT: The target file has ALREADY been replaced with new content. '
+                    f'However, the directory entry update may not be persisted to disk yet. '
+                    f'If power fails now, the file could revert to old content or disappear. '
+                    f'Missing crash-safety step: directory fsync (step 7 of 7).'
+                )
                 raise
             elif not allow_degraded:
-                warnings.append(f'Directory fsync failed and degraded mode not allowed: {e}')
+                dir_fsync_status = FsyncStatus.FAILED_DEGRADED
+                warnings.append(
+                    f'Directory fsync failed (degraded mode not allowed): {e}. '
+                    f'IMPORTANT: The target file has ALREADY been replaced with new content. '
+                    f'However, the directory entry update may not be persisted to disk yet. '
+                    f'If power fails now, the file could revert to old content or disappear. '
+                    f'Missing crash-safety step: directory fsync (step 7 of 7).'
+                )
                 raise
             else:
                 dir_fsync_status = FsyncStatus.FAILED_DEGRADED
                 warnings.append(
-                    f'Directory fsync failed with error: {e}. '
-                    f'Write succeeded but crash-safety is DEGRADED. '
-                    f'In case of power failure immediately after this call, '
-                    f'the file may appear to revert to the old content or disappear.'
+                    f'Directory fsync failed: {e}. '
+                    f'The target file has been replaced with new content, '
+                    f'but the directory entry update may not be persisted to disk. '
+                    f'If power fails now, the file could revert to old content or disappear. '
+                    f'Missing crash-safety step: directory fsync (step 7 of 7).'
                 )
 
         fully_safe = (
@@ -284,52 +408,33 @@ def atomic_write(
             fully_crash_safe=fully_safe,
             temp_file_fsync=temp_fsync_status,
             dir_fsync=dir_fsync_status,
+            renamed=renamed,
             warnings=warnings,
             target_path=path,
         )
 
+    except Exception:
+        if renamed:
+            pass
+        elif tmp_path is not None and os.path.exists(tmp_path):
+            try:
+                os.unlink(tmp_path)
+            except OSError:
+                pass
+        raise
+
     finally:
-        if tmp_path is not None and os.path.exists(tmp_path):
+        if not renamed and tmp_path is not None and os.path.exists(tmp_path):
             try:
                 os.unlink(tmp_path)
             except OSError:
                 pass
 
 
-def _verify_same_filesystem(tmp_path: str, target_path: Path, warnings: List[str]) -> None:
-    """
-    验证临时文件与目标文件是否在同一文件系统。
-    跨文件系统 rename 不是原子的，需要发出警告。
-    """
-    try:
-        tmp_stat = os.stat(tmp_path)
-        target_stat = os.stat(str(target_path)) if target_path.exists() else os.stat(str(target_path.parent))
-        if tmp_stat.st_dev != target_stat.st_dev:
-            warnings.append(
-                f'WARNING: Temporary file and target file are on different filesystems '
-                f'(st_dev={tmp_stat.st_dev} vs {target_stat.st_dev}). '
-                f'os.replace() will NOT be atomic and will fall back to copy+unlink, '
-                f'which means a mid-operation crash can leave a corrupted file. '
-                f'For true atomicity, ensure temp dir and target are on the same mount point.'
-            )
-    except OSError:
-        pass
-
-
 def atomic_write_read(
     path: Union[str, Path],
     read_encoding: Optional[str] = 'utf-8',
 ) -> Union[bytes, str]:
-    """
-    读取文件的便捷函数（配合 atomic_write 使用）。
-
-    Args:
-        path: 文件路径
-        read_encoding: 如果指定则返回 str，否则返回 bytes
-
-    Returns:
-        文件内容，bytes 或 str
-    """
     path = Path(path).resolve()
     if read_encoding is not None:
         with open(path, 'r', encoding=read_encoding) as f:
@@ -343,20 +448,20 @@ EXIT_SUCCESS = 0
 EXIT_WRITE_FAILED = 1
 EXIT_DEGRADED_SUCCESS = 2
 EXIT_INVALID_ARGS = 3
+EXIT_POST_RENAME_FAILURE = 4
 
 
 def main(argv: Optional[List[str]] = None) -> int:
     """
-    命令行入口：
-        atomic-write <target_path> --text "content to write"
-        atomic-write <target_path> --file <source_file>
-        atomic-write <target_path> --file -   # 从 stdin 读取
+    命令行入口。
 
     退出码：
         0: 成功且完整崩溃安全
         1: 写入失败（目标文件未被修改）
         2: 写入成功但降级（部分 fsync 失败，崩溃安全不完整）
         3: 参数错误
+        4: 写入部分完成（rename 已执行但目录 fsync 失败，strict/no-degraded 模式下报错）
+           目标文件已被替换为新内容，但目录项可能未持久化
     """
     parser = argparse.ArgumentParser(
         prog='atomic-write',
@@ -364,23 +469,31 @@ def main(argv: Optional[List[str]] = None) -> int:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog='''
 Exit codes:
-  0  Success, fully crash-safe
-  1  Write failed (target file unchanged)
-  2  Write succeeded but DEGRADED (partial fsync failure, not fully crash-safe)
+  0  Success, fully crash-safe (all fsync steps completed)
+  1  Write failed BEFORE rename (target file UNCHANGED, still has old content)
+  2  Write succeeded but DEGRADED (directory fsync failed, partial crash-safety)
   3  Invalid arguments
+  4  Write PARTIALLY completed: rename done but directory fsync failed
+     in strict/no-degraded mode. Target file HAS new content but directory
+     entry may not be persisted. Power loss could revert to old content.
 
 Examples:
   atomic-write config.json --text '{"key": "value"}'
   atomic-write data.bin --file /tmp/new_data.bin
   cat large_file.txt | atomic-write output.txt --file -
   atomic-write important.txt --text "hello" --strict
+  atomic-write --check /path/to/target.txt
+  atomic-write --dry-run config.json
         ''',
     )
+
     parser.add_argument(
         'target',
+        nargs='?',
         help='Target file path to write atomically',
     )
-    input_group = parser.add_mutually_exclusive_group(required=True)
+
+    input_group = parser.add_mutually_exclusive_group()
     input_group.add_argument(
         '--text',
         help='Text content to write (encoded as UTF-8 by default)',
@@ -389,6 +502,19 @@ Examples:
         '--file',
         help='Source file path to read content from. Use "-" for stdin.',
     )
+    input_group.add_argument(
+        '--check',
+        action='store_true',
+        help='Check crash-safety capabilities for target path without writing. '
+             'Tests directory fsync support and filesystem compatibility.',
+    )
+    input_group.add_argument(
+        '--dry-run',
+        action='store_true',
+        help='Simulate a write to target path without actually writing. '
+             'Reports same checks as --check plus whether the write would succeed.',
+    )
+
     parser.add_argument(
         '--encoding',
         default='utf-8',
@@ -408,7 +534,7 @@ Examples:
     parser.add_argument(
         '--strict',
         action='store_true',
-        help='Strict mode: any fsync failure causes hard error (exit 1) instead of degraded success',
+        help='Strict mode: any fsync failure causes hard error instead of degraded success',
     )
     parser.add_argument(
         '--no-degraded',
@@ -422,6 +548,20 @@ Examples:
     )
 
     args = parser.parse_args(argv)
+
+    if args.check or args.dry_run:
+        if args.target is None:
+            print('Error: target path is required for --check / --dry-run', file=sys.stderr)
+            return EXIT_INVALID_ARGS
+        return _run_check(args)
+
+    if args.target is None:
+        print('Error: target path is required', file=sys.stderr)
+        return EXIT_INVALID_ARGS
+
+    if args.text is None and args.file is None:
+        print('Error: one of --text, --file, --check, or --dry-run is required', file=sys.stderr)
+        return EXIT_INVALID_ARGS
 
     allow_degraded = not args.no_degraded
 
@@ -463,13 +603,32 @@ Examples:
             strict=args.strict,
         )
     except OSError as e:
-        print(f'Error: Atomic write failed: {e}', file=sys.stderr)
-        print(f'Note: Target file should be unchanged (still contains old content)', file=sys.stderr)
-        return EXIT_WRITE_FAILED
+        is_post_rename = (
+            isinstance(e, OSError)
+            and hasattr(e, 'args')
+            and 'Directory fsync' in str(e) or 'FlushFileBuffers' in str(e) or 'fsync' in str(e).lower()
+        )
+        if is_post_rename and (args.strict or not allow_degraded):
+            print(
+                f'Error: Directory fsync failed after rename: {e}',
+                file=sys.stderr,
+            )
+            print(
+                'IMPORTANT: The target file HAS been replaced with new content, '
+                'but the directory entry update may not be persisted to disk. '
+                'If power fails now, the file could revert to old content or disappear. '
+                'Missing crash-safety step: directory fsync.',
+                file=sys.stderr,
+            )
+            return EXIT_POST_RENAME_FAILURE
+        else:
+            print(f'Error: Atomic write failed before rename: {e}', file=sys.stderr)
+            print('The target file is unchanged (still contains old content).', file=sys.stderr)
+            return EXIT_WRITE_FAILED
 
     if result.success:
         if not args.quiet:
-            print(f'Wrote {len(data)} bytes to {result.target_path}')
+            print(f'Wrote to {result.target_path}')
             print(f'  Temp file fsync: {result.temp_file_fsync}')
             print(f'  Directory fsync: {result.dir_fsync}')
             print(f'  Fully crash-safe: {"YES" if result.fully_crash_safe else "NO"}')
@@ -480,7 +639,7 @@ Examples:
             return EXIT_SUCCESS
         else:
             print(
-                'DEGRADED MODE: Write succeeded but full crash-safety NOT guaranteed. '
+                'DEGRADED: Write succeeded but full crash-safety NOT guaranteed. '
                 'See warnings above.',
                 file=sys.stderr,
             )
@@ -488,6 +647,62 @@ Examples:
     else:
         print('Error: Write reported failure without exception', file=sys.stderr)
         return EXIT_WRITE_FAILED
+
+
+def _run_check(args) -> int:
+    check = check_crash_safety(args.target)
+
+    if args.quiet:
+        if check.would_be_fully_crash_safe:
+            return EXIT_SUCCESS
+        return EXIT_DEGRADED_SUCCESS
+
+    print(f'Crash-safety check for: {check.target_path}')
+    print(f'  Parent directory: {check.parent_dir}')
+    print(f'  Parent directory exists: {"YES" if check.parent_dir_exists else "NO (will be created on write)"}')
+
+    if check.same_filesystem is None:
+        print('  Same filesystem: UNKNOWN (could not determine)')
+    elif check.same_filesystem:
+        print('  Same filesystem: YES (rename will be atomic)')
+    else:
+        print('  Same filesystem: NO (rename will be copy+unlink, NOT atomic!)')
+
+    if check.dir_fsync_supported is None:
+        print('  Directory fsync: NOT TESTED (parent dir does not exist)')
+    elif check.dir_fsync_supported:
+        print('  Directory fsync: SUPPORTED')
+    else:
+        print(f'  Directory fsync: NOT SUPPORTED ({check.dir_fsync_error})')
+
+    if check.would_be_fully_crash_safe:
+        print('  Crash-safety level: FULL (rename atomic + directory entry persisted)')
+    else:
+        missing = []
+        if not check.parent_dir_exists:
+            missing.append('parent directory must be created first')
+        if check.same_filesystem is not True:
+            missing.append('rename will NOT be atomic (different filesystems)')
+        if check.dir_fsync_supported is not True:
+            missing.append('directory fsync not supported (directory entry may not persist after rename)')
+        print(f'  Crash-safety level: DEGRADED')
+        print(f'  Missing guarantees: {"; ".join(missing)}')
+
+    for w in check.warnings:
+        print(f'  WARNING: {w}', file=sys.stderr)
+
+    if args.dry_run:
+        print()
+        if check.would_be_fully_crash_safe:
+            print('Dry-run result: Write would be FULLY crash-safe (exit code 0)')
+        elif check.dir_fsync_supported is False or check.same_filesystem is False:
+            print('Dry-run result: Write would succeed in DEGRADED mode (exit code 2)')
+        else:
+            print('Dry-run result: Write would likely succeed but crash-safety is uncertain')
+
+    if check.would_be_fully_crash_safe:
+        return EXIT_SUCCESS
+    return EXIT_DEGRADED_SUCCESS
 
 
 if __name__ == '__main__':

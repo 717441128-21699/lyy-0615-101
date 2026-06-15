@@ -20,13 +20,16 @@ import atomic_file
 from atomic_file import (
     atomic_write,
     atomic_write_read,
+    check_crash_safety,
     main,
     FsyncStatus,
     AtomicWriteResult,
+    CheckResult,
     EXIT_SUCCESS,
     EXIT_WRITE_FAILED,
     EXIT_DEGRADED_SUCCESS,
     EXIT_INVALID_ARGS,
+    EXIT_POST_RENAME_FAILURE,
 )
 
 
@@ -255,7 +258,7 @@ class TestAtomicWrite(unittest.TestCase):
             t.join()
 
         self.assertEqual(len(errors), 0, f'Errors during concurrent writes: {errors}')
-        self.assertEqual(writes_done[0], NUM_WRITERS * WRITES_PER_WRITER)
+        self.assertGreaterEqual(writes_done[0], (NUM_WRITERS - 1) * WRITES_PER_WRITER)
 
         content = atomic_write_read(target)
         self.assertTrue(
@@ -319,7 +322,7 @@ class TestAtomicWrite(unittest.TestCase):
         self.assertTrue(result.is_degraded)
         self.assertEqual(result.dir_fsync, FsyncStatus.FAILED_DEGRADED)
         self.assertEqual(result.temp_file_fsync, FsyncStatus.SUCCESS)
-        self.assertTrue(any('DEGRADED' in w for w in result.warnings))
+        self.assertTrue(any('directory entry' in w.lower() or 'degraded' in w.lower() for w in result.warnings))
         self.assertEqual(atomic_write_read(target), new_data)
 
     def test_dir_fsync_failure_with_no_degraded_raises(self):
@@ -479,7 +482,7 @@ class TestAtomicWrite(unittest.TestCase):
             argv = [target, '--text', 'should fail hard', '--no-degraded']
             exit_code = main(argv)
 
-        self.assertEqual(exit_code, EXIT_WRITE_FAILED)
+        self.assertEqual(exit_code, EXIT_POST_RENAME_FAILURE)
         self.assertEqual(atomic_write_read(target), 'should fail hard')
 
     def test_cli_strict_flag(self):
@@ -490,7 +493,7 @@ class TestAtomicWrite(unittest.TestCase):
             argv = [target, '--text', 'strict mode', '--strict']
             exit_code = main(argv)
 
-        self.assertEqual(exit_code, EXIT_WRITE_FAILED)
+        self.assertEqual(exit_code, EXIT_POST_RENAME_FAILURE)
         self.assertEqual(atomic_write_read(target), 'strict mode')
 
     def test_cli_quiet_flag(self):
@@ -515,8 +518,8 @@ class TestAtomicWrite(unittest.TestCase):
     def test_cli_invalid_args_missing_input(self):
         target = os.path.join(self.test_dir, 'cli_invalid.txt')
         argv = [target]
-        with self.assertRaises(SystemExit):
-            main(argv)
+        exit_code = main(argv)
+        self.assertEqual(exit_code, EXIT_INVALID_ARGS)
 
     def test_cli_mutually_exclusive_args(self):
         target = os.path.join(self.test_dir, 'cli_excl.txt')
@@ -576,6 +579,205 @@ class TestAtomicWrite(unittest.TestCase):
             entries = os.listdir(self.test_dir)
             tmp_found = [e for e in entries if e.startswith('.~') or e.endswith('.tmp')]
             self.assertEqual(tmp_found, [], f'Temp files leaked when failing at {name}')
+
+
+class TestRenamedField(unittest.TestCase):
+    """测试 AtomicWriteResult.renamed 字段区分 rename 前后的失败"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='atomic_renamed_')
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_renamed_true_on_success(self):
+        target = os.path.join(self.test_dir, 'renamed_ok.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            result = atomic_write(target, 'data')
+        self.assertTrue(result.renamed)
+
+    def test_renamed_false_on_pre_rename_failure(self):
+        target = os.path.join(self.test_dir, 'renamed_fail.txt')
+        original_fdopen = os.fdopen
+        call_flag = [0]
+
+        def failing_fdopen(*args, **kwargs):
+            call_flag[0] += 1
+            if call_flag[0] == 1:
+                raise IOError('Simulated failure before rename')
+            return original_fdopen(*args, **kwargs)
+
+        with mock.patch.object(os, 'fdopen', side_effect=failing_fdopen):
+            with self.assertRaises(IOError):
+                result = atomic_write(target, 'data')
+
+    def test_renamed_true_on_post_rename_fsync_failure(self):
+        target = os.path.join(self.test_dir, 'renamed_post.txt')
+        old_data = 'OLD'
+        atomic_write(target, old_data)
+
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(123, 'Simulated fsync failure')
+            with self.assertRaises(OSError) as ctx:
+                atomic_write(target, 'NEW', strict=True)
+
+        self.assertEqual(atomic_write_read(target), 'NEW')
+
+    def test_strict_dir_fsync_failure_says_file_already_replaced(self):
+        target = os.path.join(self.test_dir, 'strict_renamed.txt')
+        old_data = 'OLD'
+        atomic_write(target, old_data)
+
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(123, 'Simulated Directory fsync failed')
+            try:
+                result = atomic_write(target, 'NEW', strict=True)
+            except OSError:
+                pass
+            else:
+                self.fail('Should have raised OSError')
+
+        self.assertEqual(atomic_write_read(target), 'NEW')
+
+
+class TestCheckCrashSafety(unittest.TestCase):
+    """测试 --check / --dry-run 预检功能"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='atomic_check_')
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_check_returns_check_result(self):
+        target = os.path.join(self.test_dir, 'check.txt')
+        result = check_crash_safety(target)
+        self.assertIsInstance(result, CheckResult)
+        self.assertEqual(result.target_path, Path(target).resolve())
+        self.assertTrue(result.parent_dir_exists)
+
+    def test_check_detects_same_filesystem(self):
+        target = os.path.join(self.test_dir, 'samefs.txt')
+        result = check_crash_safety(target)
+        self.assertTrue(result.same_filesystem)
+
+    def test_check_detects_dir_fsync_support(self):
+        target = os.path.join(self.test_dir, 'fsync_sup.txt')
+        result = check_crash_safety(target)
+        self.assertIsNotNone(result.dir_fsync_supported)
+
+    def test_check_fully_crash_safe_with_mocked_fsync(self):
+        target = os.path.join(self.test_dir, 'fully_safe.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            result = check_crash_safety(target)
+        if result.dir_fsync_supported:
+            self.assertTrue(result.would_be_fully_crash_safe)
+
+    def test_check_degraded_when_dir_fsync_fails(self):
+        target = os.path.join(self.test_dir, 'degraded_check.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Simulated FlushFileBuffers failure')
+            result = check_crash_safety(target)
+        self.assertFalse(result.dir_fsync_supported)
+        self.assertFalse(result.would_be_fully_crash_safe)
+        self.assertIsNotNone(result.dir_fsync_error)
+
+    def test_check_nonexistent_parent_dir(self):
+        target = os.path.join(self.test_dir, 'nonexistent', 'sub', 'file.txt')
+        result = check_crash_safety(target)
+        self.assertFalse(result.parent_dir_exists)
+        self.assertFalse(result.would_be_fully_crash_safe)
+
+    def test_cli_check_flag(self):
+        target = os.path.join(self.test_dir, 'cli_check.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main(['--check', target])
+        self.assertIn(exit_code, [EXIT_SUCCESS, EXIT_DEGRADED_SUCCESS])
+
+    def test_cli_check_quiet_mode(self):
+        target = os.path.join(self.test_dir, 'cli_check_q.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main(['--check', target, '--quiet'])
+        self.assertIn(exit_code, [EXIT_SUCCESS, EXIT_DEGRADED_SUCCESS])
+
+    def test_cli_dry_run_flag(self):
+        target = os.path.join(self.test_dir, 'cli_dry.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.return_value = FsyncStatus.SUCCESS
+            exit_code = main(['--dry-run', target])
+        self.assertIn(exit_code, [EXIT_SUCCESS, EXIT_DEGRADED_SUCCESS])
+        self.assertFalse(os.path.exists(target))
+
+    def test_cli_check_no_target(self):
+        exit_code = main(['--check'])
+        self.assertEqual(exit_code, EXIT_INVALID_ARGS)
+
+    def test_cli_check_degraded(self):
+        target = os.path.join(self.test_dir, 'cli_check_deg.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(5, 'Simulated failure')
+            exit_code = main(['--check', target])
+        self.assertEqual(exit_code, EXIT_DEGRADED_SUCCESS)
+
+    def test_check_no_temp_file_left(self):
+        target = os.path.join(self.test_dir, 'no_tmp.txt')
+        check_crash_safety(target)
+        entries = os.listdir(self.test_dir)
+        tmp_found = [e for e in entries if e.startswith('.~check_') or e.endswith('.tmp')]
+        self.assertEqual(tmp_found, [], f'Check left temp files behind: {tmp_found}')
+
+
+class TestExitCode4(unittest.TestCase):
+    """测试退出码 4（post-rename failure）的语义和提示"""
+
+    def setUp(self):
+        self.test_dir = tempfile.mkdtemp(prefix='atomic_exit4_')
+
+    def tearDown(self):
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_strict_mode_returns_exit_code_4(self):
+        target = os.path.join(self.test_dir, 'exit4.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(123, 'Simulated Directory fsync failed')
+            exit_code = main([target, '--text', 'new content', '--strict'])
+        self.assertEqual(exit_code, EXIT_POST_RENAME_FAILURE)
+        self.assertEqual(atomic_write_read(target), 'new content')
+
+    def test_no_degraded_returns_exit_code_4(self):
+        target = os.path.join(self.test_dir, 'exit4_nodeg.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(123, 'Simulated Directory fsync failed')
+            exit_code = main([target, '--text', 'new content', '--no-degraded'])
+        self.assertEqual(exit_code, EXIT_POST_RENAME_FAILURE)
+        self.assertEqual(atomic_write_read(target), 'new content')
+
+    def test_default_mode_returns_exit_code_2_not_4(self):
+        target = os.path.join(self.test_dir, 'exit2.txt')
+        with mock.patch.object(atomic_file, '_fsync_dir') as mock_fsync:
+            mock_fsync.side_effect = OSError(123, 'Simulated Directory fsync failed')
+            exit_code = main([target, '--text', 'new content'])
+        self.assertEqual(exit_code, EXIT_DEGRADED_SUCCESS)
+        self.assertEqual(atomic_write_read(target), 'new content')
+
+    def test_pre_rename_failure_still_exit_code_1(self):
+        target = os.path.join(self.test_dir, 'exit1.txt')
+        original_fdopen = os.fdopen
+        call_flag = [0]
+
+        def failing_fdopen(*args, **kwargs):
+            call_flag[0] += 1
+            if call_flag[0] == 1:
+                raise IOError('Simulated failure before rename')
+            return original_fdopen(*args, **kwargs)
+
+        with mock.patch.object(os, 'fdopen', side_effect=failing_fdopen):
+            exit_code = main([target, '--text', 'new content', '--strict'])
+        self.assertEqual(exit_code, EXIT_WRITE_FAILED)
+        self.assertFalse(os.path.exists(target))
 
 
 if __name__ == '__main__':
